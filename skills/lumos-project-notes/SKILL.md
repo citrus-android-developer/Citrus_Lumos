@@ -88,6 +88,8 @@ vault 名 = 資料夾 basename,lumos 自動解析。**全程無需 Obsidian**(�
 
 每行一個前綴。Systems 重 `FLOW`+`KEY`+`DEP`+`TEST`;Issues 重 `FLAG`+`DECISION`+`KEY`;Verification 重 `TEST`+`VERIFY`。
 
+★位置是 frontmatter 的 `summary:` 欄位(`summary: |-` 底下逐行),不是 body 裡開一個 `## Summary` 標題★——寫錯位置的症狀很陰:`search` 照樣命中、標籤照樣解析出 `[★INVARIANT★]`,但 `contracts`／`guard` 會回「(無合約標記)」,讀的人因此以為這個節點沒有硬合約。這是靜默給錯答案,不是報錯。
+
 | 前綴 | 用途 | 前綴 | 用途 |
 |---|---|---|---|
 | `FLOW:` | 核心流程 `a→b→c` | `VERIFY:` | 驗證紀錄 `[[..]]` |
