@@ -1309,7 +1309,8 @@ def _is_forgotten(env, rel):
 
 
 def cmd_search(env, term, path_prefix=None, regex=False, files_only=False, include_code=False,
-               ranked=False, top=20, as_json=False, include_superseded=False):
+               ranked=False, top=20, as_json=False, include_superseded=False,
+               any_terms=True):
     """全文搜尋(frontmatter + body)。預設大小寫不敏感 substring;--regex 用正則。
     預設**排除 fenced code 區塊 + inline code**(對齊 doctor 連結抽取的慣例,--code 才含);
     context 標記命中區域(★INVARIANT★/KEY/fm:欄位/body)。職責=自由文字;結構化查詢走
@@ -1327,6 +1328,78 @@ def cmd_search(env, term, path_prefix=None, regex=False, files_only=False, inclu
     else:
         needle = nfc(term).lower()
         matches = lambda s: needle in nfc(s).lower()
+    # ★多詞回退(2026-08-02;Projects/檢索多詞回退_計劃)★
+    # 問題:候選階段是★整串子字串比對★——`search "BM25 檢索 排序"` 只要那幾個字沒連在
+    # 一起出現過就是 0 候選。而 BM25F 本身完全會處理多詞(`impact --diff` 拿整段 hunk 當
+    # query 運作正常),壞的是前面這道撈候選的關卡。
+    # ★fallback-only,不是「永遠 OR」★:只在整串片語★全庫都找不到★時,才退成各詞 OR 召回。
+    #   為什麼不無條件 OR:`_rank_score_candidates` 的 N/df/avgdl ★以候選集為語料★,擴召回
+    #   會擾動所有既有查詢的排序。實測現有 goldset 30 題全部回 >0 候選 → 回退條件永不
+    #   觸發 → 那 30 題行為一行不變,★零回歸是機械可證的,不是量出來的★。
+    # ★為什麼用「掃描前預檢」而不是「掃完發現 0 再掃一次」★:後者要把整個主迴圈包進
+    #   兩趟結構,而 legacy 模式是★邊掃邊 print★,兩趟會把同一次查詢印兩份;改成先緩衝
+    #   再印等於為了一條死路重排主迴圈,風險不成比例。預檢只在多詞時跑,且一找到就 break。
+    # ★已知邊界(誠實)★:預檢用簡化的 fence/inline-code 剝除近似主迴圈的排除規則,不是
+    #   同一份實作。極端情況(未閉合的 ``` 圍欄)兩者判斷可能不一致——方向是★保守★:
+    #   預檢誤判成「找得到」時只是不回退(維持現況),不會造成錯誤召回。
+    _fb_terms = [t for t in nfc(term).lower().split() if t] if not regex else []
+    _fb_used = False
+    # ★2026-08-03 起為預設(人裁)★——`--no-any` 逃生。翻預設的證據
+    # (Projects/檢索多詞回退_計劃 M4):
+    #   ①現況是「每個現實多詞查詢都回 0」(Landmark 284 篇 10/10、本庫快照 10/10)
+    #   ②回退後 nDCG@5 0→0.767、MRR 0.95、第一名為「必看」7/10
+    #     (雙評 Claude+Codex 跨家族、分歧交乾淨 opus 裁決)
+    #   ③★零回歸機械可證★(回退只在整串片語全庫無命中時觸發)+對照組 5 題逐檔完全相同
+    #   ④M1.5 逐詞覆蓋已把「查無」訊號還回來 ⑤查無任何機器消費端依賴「回 0」語意
+    # ★誠實邊界★:pooling bias(候選池半數來自回退自己的 top-10)、n=10、單一快照。
+    _fb_cov = {}        # M1.5:逐詞覆蓋(term -> 命中篇數);只在回退真的觸發時才印
+    if any_terms and (not regex) and len(_fb_terms) > 1:
+        _fb_seen = False
+        for _r in sorted(env.notes):
+            if path_prefix and not _r.startswith(path_prefix):
+                continue
+            # ★與主迴圈同樣排除「真遺忘(superseded)」的節點★——不排的話逐詞覆蓋會
+            # 比實際搜得到的多(2026-08-02 實測:門檻 55 vs 搜尋顯示的 50,差在 7 筆
+            # 被隱藏的作廢節點)。覆蓋數若>實際,使用者會以為「這個詞有東西」而其實
+            # 搜不到,★誤導方向與本功能要解的問題正好相反★。
+            if not include_superseded and _is_forgotten(env, _r):
+                continue
+            try:
+                _t = (env.vault / _r).read_text(encoding="utf-8-sig")
+            except Exception:
+                continue
+            if not include_code:
+                _t = re.sub(r"(?ms)^\s*```.*?^\s*```", "", _t)
+                _t = INLINE_CODE_RE.sub("", _t)
+            _low = nfc(_t).lower()
+            # ★順手數逐詞覆蓋(M1.5)★:本圈本來就讀了每個檔、也做過同樣的排除,
+            # 多幾次子字串測試幾乎免費;不另開一圈。找到片語就 break,那時
+            # 覆蓋數不完整——但那條路不會回退、也就不會印,無害。
+            for _t2 in _fb_terms:
+                if _t2 in _low:
+                    _fb_cov[_t2] = _fb_cov.get(_t2, 0) + 1
+            if needle in _low:
+                _fb_seen = True
+                break
+        if not _fb_seen:
+            _fb_used = True
+            matches = lambda s: any(t in nfc(s).lower() for t in _fb_terms)
+            # ★M1.5:把「查無」這個訊號用另一種形式還回來★
+            # 為什麼需要:回退之後搜尋★幾乎不可能再回 0★——你永遠會拿到看起來
+            # 合理的東西,而那可能只是常見詞的噪音。今天「0 筆」至少有時候代表
+            # 「這個概念不在圖譜裡」,回退把那個訊號吃掉了。
+            # 2026-08-02 Landmark 284 篇實測的實例:查「續會 門檻 計算」第一名是
+            # 「停車折抵」,看起來像排序爛——其實是「續會」全庫 0 篇(查詢用詞猜錯),
+            # 剩下兩個常見詞(門檻 50/計算 35)把結果洗走。逐詞覆蓋一印就當場看穿。
+            # ★走 stderr★:與既有的「已隱藏 N 筆作廢結果」同一慣例,不污染 stdout
+            # 的機器可讀輸出(--json/--files-only 的呼叫端會解析它)。
+            _cov_txt = "  ".join(f"★{t}:0★" if _fb_cov.get(t, 0) == 0 else f"{t}:{_fb_cov.get(t, 0)}"
+                                 for t in _fb_terms)
+            print(f"（多詞回退:整串片語全庫無命中,改用各詞 OR 召回;"
+                  f"逐詞覆蓋 {_cov_txt}）", file=sys.stderr)
+            if any(_fb_cov.get(t, 0) == 0 for t in _fb_terms):
+                print("  ★有詞在全庫 0 命中(標 ★)——多半是查詢用詞與圖譜用語不一致,"
+                      "先換那個詞再查,別把結果當「圖譜沒有」★", file=sys.stderr)
     if ranked and regex:
         print("(--ranked 不適用 --regex 模式,照舊輸出)", file=sys.stderr)
         ranked = False
@@ -2215,6 +2288,26 @@ _COMPRESS_OPEN_RE = re.compile(r"-\s*\[\s\]|TODO|BLOCKER|⏳|未結", re.I)
 
 
 _TIER_PARAMS = {"light": (1, 2), "standard": (3, 3), "high": (5, 3), "legacy": (1, 6)}  # tier→(width, cap)
+# ★一輪能丟多少給審查員的軟上限★(2026-08-02)
+# 為什麼有這條:審查員的任務是「在 N 行裡找出那個植入的錯」,而 context rot(脈絡越長、
+# 注意力越差)是已發表的實測現象——有效脈絡長度約標稱值的 60-70%,★退化在 32K token 就
+# 量得到★(不必塞爆),報告的退化幅度 13.9%-85%。
+# ★這條門檻★純粹★借自外部文獻,本專案自己的資料不支持它★(2026-08-02 更正,
+# 原註解在此宣稱「本專案資料落在線的兩邊、方向是反的」——★那個宣稱是錯的,已撤★):
+#   ① 原始觀察(code-slim-python r1/r2 大 payload 零 findings、r3-r6 小 payload 有 findings)
+#      經查證★兩組審的根本不是同一份碼★(前者 bash→Python 移植,後者後來才寫的 manifest 步驟),
+#      拿來比就是拿蘋果比橘子,不構成任何證據。
+#   ② 之後跑了★兩次刻意設計的對照實驗★(見圖譜 [[Projects/審查規模對照實驗]] 與
+#      [[Projects/審查規模對照實驗二_Landmark真缺陷]]),★都不支持「量大→漏看」★:
+#      命中率沒掉。實驗二甚至 7/7 全中,撞到天花板。
+#   ③ 反而浮出另一個假說:量大影響的可能不是「有沒有看到」而是★判斷的自信度★——
+#      大 payload 的席位會★有把握地宣稱有缺陷的地方沒問題★(見 [[Projects/規模影響判斷力假說]],
+#      3/3 大 payload 席位講反、1/1 小 payload 席位找到)。★該假說 n=4、觀察性、
+#      編碼者=提出者,尚未閉合 maker≠checker,★不得據以動 gate★。
+# 門檻取 1800 行 ≈ 30K token,是★借用已發表的 32K 起點取略保守整數★,不是本專案量出來的。
+# 這是軟上限:超過不擋(輪已經跑完才記帳,擋也來不及),但★記進帳並要求收斂宣稱講小★。
+_CANARY_SCOPE_SOFT_CAP_LINES = 1800
+
 _CANARY_TYPES = ("a", "b", "c", "d")   # 壞交叉引用/未定義旗標/未定義欄位常數/未定義產物裸檔名
 
 
@@ -5200,6 +5293,8 @@ def cmd_archive(env, days, apply, today):
 
 
 
+
+
 def _extract_claude_block_span(text: str):
     """定位 CLAUDE.md 中的 LUMOS:GRAPH-DISCIPLINE sentinel 區塊,回傳三態。
 
@@ -5912,6 +6007,10 @@ def main():
     p.add_argument("--files-only", action="store_true", help="只列檔名+命中數")
     p.add_argument("--code", action="store_true", help="含 code block(預設排除,對齊 doctor)")
     p.add_argument("--ranked", action="store_true", help="BM25F 相關性排序(2026-07-11 起已是預設,旗標保留相容)")
+    p.add_argument("--any", action="store_true", dest="search_any",
+                   help="多詞回退(2026-08-03 起已是預設,旗標保留相容)")
+    p.add_argument("--no-any", action="store_true", dest="search_no_any",
+                   help="關閉多詞回退:整串片語找不到就回 0,不退成各詞 OR 召回")
     p.add_argument("--legacy", action="store_true", dest="search_legacy",
                    help="舊行為:字母序+全量輸出(轉正前預設;--regex 自動走此路)")
     p.add_argument("--top", type=int, default=0, help="相關性排序輸出上限(0=全量,預設;圖譜先行不靜默截斷)")
@@ -6044,7 +6143,8 @@ def main():
         return cmd_search(env, args.term, path_prefix=args.path_prefix,
                           regex=args.regex, files_only=args.files_only,
                           include_code=args.code, ranked=_use_ranked, top=args.top,
-                          as_json=args.search_json, include_superseded=args.include_superseded)
+                          as_json=args.search_json, include_superseded=args.include_superseded,
+                          any_terms=not args.search_no_any)
 
     if args.cmd == "contracts":
         rel = None
