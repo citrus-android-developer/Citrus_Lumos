@@ -414,5 +414,48 @@ def main(argv=None):
     return 0
 
 
+def _main_guarded(argv=None):
+    """把 `main()` 的檔案系統例外轉成一句可行動的訊息 + rc2,不噴 traceback。
+
+    ★這裡刻意不學 uninstall.py 的做法★:uninstall 宣告的合約是「各步互不阻擋」
+    (一步失敗其餘照跑),所以它是逐步吞 `OSError` 再彙總;install 的 `main()`
+    正好相反——它是★遇錯早退★的(`rc != 0` 就 return),因為每一步依賴前一步,
+    裝到一半就該停下來,而不是硬著頭皮把 skill 裝進一個沒有 CLI 的環境。
+    在 install 這邊逐處包 try/except 讓它繼續跑會★把它的順序語意改掉★,
+    那不是修 bug 是製造 bug。
+
+    所以這裡只做一件事:例外別以 traceback 的形式丟給使用者。使用者看到
+    `PermissionError` 的堆疊完全不知道要幹嘛,看到「權限不足,請確認 X 可寫」
+    才知道。控制流一行都沒動。
+
+    ★半成品狀態是已知且刻意保留的★:中途失敗會留下已完成的前幾步(例如 CLI
+    裝好了、skill 沒裝成)。精簡版不做交易式回滾——回滾本身也會失敗,而且刪
+    使用者的東西風險比留著高;重跑 `install.py --force` 即可收斂到完整狀態。
+    """
+    try:
+        return main(argv)
+    except UnicodeDecodeError as e:
+        # ★同一個 reviewer、同一種漏法(2026-08-02)★:`_merge_claude_md_text()` 會
+        # 讀★使用者既有的★ CLAUDE.md,那份檔案不是我們寫的、編碼不歸我們管。
+        # 不是合法 utf-8 時拋的是 UnicodeDecodeError——★它繼承 ValueError 不是
+        # OSError★,只接 OSError 攔不到,照樣 traceback + rc1。
+        print(f"ERROR: 讀取既有 CLAUDE.md 時發現它不是合法 utf-8,已中止: {e}", file=sys.stderr)
+        print("  本安裝器只處理 utf-8;不會在看不懂內容的情況下改寫你的 CLAUDE.md。", file=sys.stderr)
+        print("  請先確認該檔編碼(或另存成 utf-8)後重跑。", file=sys.stderr)
+        # ★與下面 OSError 分支對稱地講一句半成品狀態(2026-08-02 交付包端到端真跑
+        # 時發現只有 OSError 那條有講)★——①CLI 與②skill 這時已經裝好了,只有
+        # ③CLAUDE.md 沒動;不講的話使用者會以為整件事失敗、跑去手動清理已裝好的東西。
+        print("  ★①全域指令與②skill 這時已經裝好、不會被回滾★,只有③CLAUDE.md 沒動;"
+              "修好編碼後重跑即可補上(重跑是冪等的)。", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"ERROR: 安裝過程發生檔案系統錯誤,已中止: {e}", file=sys.stderr)
+        print("  常見原因:目標路徑沒有寫入權限、磁碟空間不足、檔案被其他程式鎖住(Windows)。",
+              file=sys.stderr)
+        print("  ★已完成的步驟不會被回滾★——排除原因後重跑本腳本(加 --force 覆寫已裝好的部分)。",
+              file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_main_guarded())

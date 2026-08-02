@@ -115,7 +115,22 @@ def _restore_claude_md(target: Path):
     if not target.exists():
         return 0, f"  (未安裝: {target} 的 LUMOS-SLIM 圖譜標籤區塊 — 檔案不存在)"
 
-    current = target.read_text(encoding="utf-8")
+    # ★讀也會失敗,而且漏掉讀比漏掉寫更容易(2026-08-02 複審抓到:第一版
+    # 只把下面的 unlink()/write_text() 包起來,這一行 read_text() 留在 try 外面
+    # ——「檔案系統寫入」這個字眼讓我只掃了寫。CLAUDE.md 被 chmod 000、或內容
+    # 不是合法 utf-8(中文專案裡別的編輯器存成 Big5、貼進壞位元組都很真實)時,
+    # 這一行照樣炸穿 main(),步驟⑤一樣不會執行——跟修之前的症狀一模一樣)★。
+    # ★UnicodeDecodeError 不是 OSError 子類★(它繼承 ValueError),必須分開接;
+    # 本檔第 ①b 段讀 shim 內容時就是同時接兩種,那裡對了、這裡漏了。
+    try:
+        current = target.read_text(encoding="utf-8")
+    except OSError as e:
+        return 2, (f"⚠ 讀不到 {target},無法處理 LUMOS-SLIM 區塊(檔案系統錯誤): {e}"
+                   "——CLAUDE.md 未被修改,其餘步驟照跑;請手動處理。")
+    except UnicodeDecodeError as e:
+        return 2, (f"⚠ {target} 內容不是合法 utf-8,無法安全處理 LUMOS-SLIM 區塊: {e}"
+                   "——CLAUDE.md 未被修改(★拒絕在看不懂內容的情況下改寫它★),"
+                   "其餘步驟照跑;請自行確認該檔編碼後手動移除區塊。")
     pattern = re.compile(re.escape(SLIM_START) + r".*?" + re.escape(SLIM_END) + r"\n?", re.DOTALL)
     matches = list(pattern.finditer(current))
 
@@ -141,15 +156,25 @@ def _restore_claude_md(target: Path):
 
     new = current[:m.start()] + restore_text + current[m.end():]
 
-    if new == "":
-        target.unlink()
-        return 0, f"✓ 已移除: {target} 的 LUMOS-SLIM 圖譜標籤區塊(內容變空,檔案本身一併移除)"
-    elif restore_text:
-        target.write_text(new, encoding="utf-8")
-        return 0, f"✓ 已還原: {target} 的完整版紀律區塊(位元組級還原自內建備份),LUMOS-SLIM 區塊已移除"
-    else:
-        target.write_text(new, encoding="utf-8")
-        return 0, f"✓ 已移除: {target} 的 LUMOS-SLIM 圖譜標籤區塊(其餘內容不變)"
+    # ★這三處以前是裸呼叫(2026-08-02 補)★:寫/刪本身可能拋 OSError
+    # (唯讀目錄、磁碟滿、Windows 檔案被別的程式鎖住),而 main() 呼叫本函式時
+    # 也沒有 try——一拋就炸穿整支 main(),★後面的步驟⑤完全不會執行★,使用者
+    # 只看到 traceback。那正好違反本檔 docstring 與圖譜 ★INVARIANT★ 宣稱的
+    # 「各步驟各自獨立、互不阻擋」。改成回 rc=2 讓 main() 彙總,與本函式其他
+    # 錯誤路徑(多 sentinel、base64 解碼失敗)一致。
+    try:
+        if new == "":
+            target.unlink()
+            return 0, f"✓ 已移除: {target} 的 LUMOS-SLIM 圖譜標籤區塊(內容變空,檔案本身一併移除)"
+        elif restore_text:
+            target.write_text(new, encoding="utf-8")
+            return 0, f"✓ 已還原: {target} 的完整版紀律區塊(位元組級還原自內建備份),LUMOS-SLIM 區塊已移除"
+        else:
+            target.write_text(new, encoding="utf-8")
+            return 0, f"✓ 已移除: {target} 的 LUMOS-SLIM 圖譜標籤區塊(其餘內容不變)"
+    except OSError as e:
+        return 2, (f"⚠ {target} 的 LUMOS-SLIM 區塊移除/還原失敗(檔案系統錯誤): {e}"
+                   "——CLAUDE.md 未被修改,其餘步驟照跑;請手動處理或加 --force 重跑。")
 
 
 def main(argv=None):
@@ -187,8 +212,12 @@ def main(argv=None):
     #    install.py 那邊已經修過的「碰撞偵測要同時看兩個檔案」的鏡像缺口。
     if dst_script.exists() or dst_script.is_symlink():
         if force:
-            dst_script.unlink()
-            print(f"✓ 已移除(--force,跳過內容比對): {dst_script}")
+            try:
+                dst_script.unlink()
+                print(f"✓ 已移除(--force,跳過內容比對): {dst_script}")
+            except OSError as e:   # 見 _restore_claude_md 的說明:不得炸穿 main()
+                print(f"⚠ 移除 {dst_script} 失敗,跳過(其餘步驟照跑): {e}", file=sys.stderr)
+                bump(2)
         else:
             try:
                 cur_sha = _sha256_file(dst_script)
@@ -220,8 +249,12 @@ def main(argv=None):
                     print("  是不是本包裝的那份,拒絕移除。確定要砍就加 --force 重跑。", file=sys.stderr)
                     bump(1)
                 elif cur_sha == ref_sha:
-                    dst_script.unlink()
-                    print(f"✓ 已移除: {dst_script}")
+                    try:
+                        dst_script.unlink()
+                        print(f"✓ 已移除: {dst_script}")
+                    except OSError as e:
+                        print(f"⚠ 移除 {dst_script} 失敗,跳過(其餘步驟照跑): {e}", file=sys.stderr)
+                        bump(2)
                 else:
                     print(f"⚠ {dst_script} 內容與比對基準({ref_desc})不一致——這是「內容真的不符」,不是基準缺失。",
                           file=sys.stderr)
@@ -243,8 +276,12 @@ def main(argv=None):
     if IS_WIN:
         if dst_shim.exists() or dst_shim.is_symlink():
             if force:
-                dst_shim.unlink()
-                print(f"✓ 已移除(--force,跳過內容比對): {dst_shim}")
+                try:
+                    dst_shim.unlink()
+                    print(f"✓ 已移除(--force,跳過內容比對): {dst_shim}")
+                except OSError as e:   # 見 _restore_claude_md 的說明:不得炸穿 main()
+                    print(f"⚠ 移除 {dst_shim} 失敗,跳過(其餘步驟照跑): {e}", file=sys.stderr)
+                    bump(2)
             else:
                 try:
                     # ★用 read_bytes().decode() 比對,不用 read_text()★——後者
@@ -267,8 +304,12 @@ def main(argv=None):
 
                 if shim_text is not None:
                     if SHIM_TEXT_RE.match(shim_text):
-                        dst_shim.unlink()
-                        print(f"✓ 已移除: {dst_shim}")
+                        try:
+                            dst_shim.unlink()
+                            print(f"✓ 已移除: {dst_shim}")
+                        except OSError as e:
+                            print(f"⚠ 移除 {dst_shim} 失敗,跳過(其餘步驟照跑): {e}", file=sys.stderr)
+                            bump(2)
                     else:
                         print(f"⚠ {dst_shim} 內容不符合本包產生的 shim 樣板——可能是你自己的東西,拒絕移除。",
                               file=sys.stderr)

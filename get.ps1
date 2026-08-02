@@ -80,6 +80,19 @@ function Invoke-Get {
   } else {
     Write-Host "首次安裝,clone 到 $Dest..."
     git clone -q $RepoUrl $Dest
+    # ★這道檢查以前漏了(2026-08-02 補)★:同一個函式裡 `git pull`
+    # 那一支有檢 `$LASTEXITCODE`、`git clone` 這一支沒有,純粹是漏寫。
+    # ★不能靠 `$ErrorActionPreference = "Stop"` 兜底★——它只管 PowerShell 自己
+    # 的 cmdlet 錯誤,原生執行檔(git.exe)回非零 exit code ★不會★ 觸發終止
+    # (PS 7.3 起才有 `$PSNativeCommandUseErrorActionPreference` 可改這行為,
+    # 本腳本要支援更舊的 Windows PowerShell 5.1,不能依賴)。
+    # 漏掉的後果:clone 失敗(沒網路/私有 repo 沒權限/磁碟滿)後照樣往下走,
+    # 使用者看到的是下一段那句「交付包內容可能不完整」——把網路/權限問題
+    # 誤導成「這個包壞掉了」,查錯方向完全被帶偏。
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "ERROR: clone $RepoUrl 失敗(檢查網路連線,以及你有沒有這個 repo 的存取權限)。" -ErrorAction Continue
+      return 2
+    }
   }
 
   $InstallScript = Join-Path $Dest "install.ps1"
