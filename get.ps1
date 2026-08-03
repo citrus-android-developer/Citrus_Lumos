@@ -1,4 +1,4 @@
-# get.ps1 — 公開精簡版 一行安裝入口(Windows/PowerShell)
+﻿# get.ps1 — 公開精簡版 一行安裝入口(Windows/PowerShell)
 #
 # 用法:
 #   irm https://raw.githubusercontent.com/citrus-android-developer/Citrus_Lumos/main/get.ps1 | iex
@@ -101,7 +101,14 @@ function Invoke-Get {
     return 2
   }
 
-  & $InstallScript @Args
+  # ★`| Out-Host` 不可省(2026-08-03 中文 Windows 真機驗證抓到)★:PowerShell 函式的
+  # `return` 會帶出函式內★所有未被消費的輸出★。`&` 的 stdout 沒被指派給任何變數就
+  # 進了輸出流,`return $LASTEXITCODE` 再追加一個數字 → 呼叫端收到的是 ★Object[]★
+  # 而不是數字,實測 `SetShouldExit` 直接爆:
+  #   Cannot convert argument "exitCode", with value: "System.Object[]" ... to "System.Int32"
+  # ★`$code = $LASTEXITCODE; return $code` 解決不了★——問題出在 `&` 的 stdout 進了
+  # 輸出流,不是 return 的寫法。`| Out-Host` 讓子行程輸出直接進主機、不進 pipeline。
+  & $InstallScript @Args | Out-Host
   return $LASTEXITCODE
 }
 

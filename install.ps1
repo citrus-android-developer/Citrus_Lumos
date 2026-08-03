@@ -1,4 +1,4 @@
-# install.ps1 — 薄殼:所有安裝邏輯已搬進 install.py(stdlib only,Unix/Windows
+﻿# install.ps1 — 薄殼:所有安裝邏輯已搬進 install.py(stdlib only,Unix/Windows
 # 共用同一份原始碼)。本檔案只做兩件事:①定位套件目錄(自己所在目錄)②挑一支
 # 可用的 python 直譯器,把參數原樣轉發給 install.py。
 #
@@ -74,7 +74,14 @@ function Invoke-Install {
     return 2
   }
 
-  & $Py.Source "$Pkg\install.py" @Args
+  # ★`| Out-Host` 不可省(2026-08-03 中文 Windows 真機驗證抓到)★:PowerShell 函式的
+  # `return` 會帶出函式內★所有未被消費的輸出★。`&` 的 stdout 沒被指派給任何變數就
+  # 進了輸出流,`return $LASTEXITCODE` 再追加一個數字 → 呼叫端收到的是 ★Object[]★
+  # 而不是數字,實測 `SetShouldExit` 直接爆:
+  #   Cannot convert argument "exitCode", with value: "System.Object[]" ... to "System.Int32"
+  # ★`$code = $LASTEXITCODE; return $code` 解決不了★——問題出在 `&` 的 stdout 進了
+  # 輸出流,不是 return 的寫法。`| Out-Host` 讓子行程輸出直接進主機、不進 pipeline。
+  & $Py.Source "$Pkg\install.py" @Args | Out-Host
   return $LASTEXITCODE
 }
 

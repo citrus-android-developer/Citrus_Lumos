@@ -61,6 +61,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -321,10 +322,38 @@ def main(argv=None):
     # ② skill 目錄 —— ★移除前先備份,不直接刪★(使用者可能在裡面塞過自己的
     #    檔)。★與①獨立★:①的比對結果(移除/跳過/錯誤)不影響這一步是否執行。
     if skill.is_dir() or skill.is_symlink():
-        bak = _unique_backup_path(skill)
+        # ★備份落點必須★離開★ ~/.claude/skills/(2026-08-03 中文 Windows 真機驗證抓到)★
+        # 舊寫法 `_unique_backup_path(skill)` 是「同目錄改名」,而 ~/.claude/skills/ 正是
+        # Claude Code ★掃描 skill 的目錄★——往裡面放任何含 SKILL.md 的子目錄都會被載入。
+        # 實測卸載後下一個 session 的 skill 清單真的多出:
+        #   - lumos-project-notes.bak.20260803102236: 維護專案知識圖譜…
+        # ★也就是卸載沒有讓這個 skill 停止作用,只是換了個怪名字繼續生效★,
+        # 而訊息還印「已備份並移除」——它根本沒離開那個目錄。
+        # 落點選 ~/.local/share/lumos-slim/backups/:那裡已經是本安裝器放 manifest 的地方,
+        # 語意一致,且★不在任何掃描範圍內★。
+        _bak_root = Path.home() / ".local" / "share" / "lumos-slim" / "backups"
         try:
+            _bak_root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"⚠ 無法建立備份目錄 {_bak_root}——保留 skill 不動: {e}", file=sys.stderr)
+            bump(2)
+            _bak_root = None
+        if _bak_root is None:
+            bak = None
+        else:
+            _base = f"{skill.name}.bak.{time.strftime('%Y%m%d%H%M%S')}"
+            bak = _bak_root / _base
+            _n = 1
+            while bak.exists() or bak.is_symlink():
+                bak = _bak_root / f"{_base}.{_n}"
+                _n += 1
+        try:
+            if bak is None:
+                raise OSError("備份目錄不可用")
             skill.rename(bak)
             print(f"✓ 已備份並移除: {skill} → {bak}")
+            print(f"  (備份放在 {_bak_root},★刻意不留在 ~/.claude/skills/★"
+                  f"——留在那裡會被 Claude Code 當成一個新 skill 繼續載入)")
         except OSError as e:
             print(f"⚠ 備份/移除 {skill} 失敗——保留,不動: {e}", file=sys.stderr)
             bump(2)
@@ -334,11 +363,47 @@ def main(argv=None):
     # ③ ~/.lumos-slim —— 可移除,但同樣先確認它長得像我們的包才刪。★與①②獨立★。
     if pkg.is_dir():
         if (pkg / "scripts" / "lumos").is_file() and (pkg / "install.sh").is_file():
+            # ★Windows 上 git 把 pack 檔(.idx/.pack)設成唯讀,rmtree 預設會 PermissionError★
+            # (2026-08-03 中文 Windows 真機驗證抓到)。★而且它是「刪到一半」才撞上★——
+            # 舊訊息只說「移除失敗」,聽起來像什麼都沒動;實測 .git 目錄還在但 HEAD/config/
+            # index 已被刪掉,留下一個「看起來像 repo、實際已損壞」的目錄。
+            # ★後果是把使用者鎖死★:get.ps1 用 `Test-Path "$Dest\.git"` 判斷「是不是我們的
+            # clone」→ True → 跑 `git pull` → rc=128「not a git repository」→ 使用者看到的
+            # 錯誤訊息是「可能有本地改動,或不是 fast-forward」,★完全指錯方向★。
+            # 修法兩件:①唯讀檔改成可寫再刪(Windows 經典陷阱的標準解)
+            #          ②真的失敗時★明講「已部分刪除、不再是可用的 clone」★,不要讓使用者
+            #            以為什麼都沒發生(訊息誤導比失敗本身更貴)。
+            def _on_rm_error(func, path, _exc):
+                # ★不能寫成 `os.chmod(path, stat.S_IWRITE)`★——那是「設定」不是「加上」:
+                # 對★目錄★會把執行位元一起拿掉,反而更刪不掉(自測踩到)。
+                # 正解=在既有 mode 上★補★寫入位元;目錄再補執行位元(要能進去才刪得掉)。
+                try:
+                    _m = os.stat(path).st_mode
+                    _add = stat.S_IWUSR | (stat.S_IXUSR if os.path.isdir(path) else 0)
+                    os.chmod(path, _m | _add)
+                    # 父目錄沒有寫入權時,刪不掉裡面的項目——一起補
+                    _par = os.path.dirname(path)
+                    if _par and os.path.isdir(_par):
+                        os.chmod(_par, os.stat(_par).st_mode | stat.S_IWUSR | stat.S_IXUSR)
+                    func(path)
+                except OSError:
+                    raise
             try:
-                shutil.rmtree(pkg)
+                # Python 3.12 起 onerror 改名 onexc(簽名不同);本包宣告 ≥3.8,兩邊都要能跑
+                if sys.version_info >= (3, 12):
+                    shutil.rmtree(pkg, onexc=lambda f, pth, e: _on_rm_error(f, pth, e))
+                else:
+                    shutil.rmtree(pkg, onerror=_on_rm_error)
                 print(f"✓ 已移除: {pkg}")
             except OSError as e:
                 print(f"⚠ 移除 {pkg} 失敗: {e}", file=sys.stderr)
+                if pkg.exists():
+                    print(f"  ★注意:{pkg} 已被★部分刪除★,它不再是一個可用的 clone。",
+                          file=sys.stderr)
+                    print(f"  重跑一行安裝會看到「更新失敗/不是 fast-forward」之類的訊息"
+                          f"——那是誤導,真正的狀況是這個目錄壞了。", file=sys.stderr)
+                    print(f"  請手動移除整個 {pkg} 後再重裝"
+                          f"(Windows: Remove-Item -Recurse -Force '{pkg}')。", file=sys.stderr)
                 bump(2)
         else:
             print(f"⚠ {pkg} 存在,但內容不像本包(缺 scripts/lumos 或 install.sh)——保留,不動。",
@@ -423,6 +488,23 @@ def main(argv=None):
         print("⚠ 部分項目基於安全考量主動跳過,理由見上面——確定要處理就重跑加 --force。")
     else:
         print("✗ 有真正的錯誤(非安全性跳過),理由見上面——需要手動處理。")
+    # ★備份是刻意留下的殘留,必須在彙總裡明講(2026-08-03)★——否則就是原本 manifest
+    # 殘留那條缺陷的同一形狀:彙總說「全部完成」,實際上 $HOME 底下留了東西。
+    # 差別在這次是★刻意★留的(那是使用者可能塞過自己筆記的 skill 備份),但
+    # ★刻意留 ≠ 可以不講★。
+    _bk = Path.home() / ".local" / "share" / "lumos-slim" / "backups"
+    try:
+        _left = sorted(x.name for x in _bk.iterdir()) if _bk.is_dir() else []
+    except OSError:
+        _left = []
+    if _left:
+        print(f"★刻意保留★:skill 備份 {len(_left)} 份留在 {_bk}")
+        for _x in _left[:5]:
+            print(f"        • {_x}")
+        if len(_left) > 5:
+            print(f"        … 還有 {len(_left) - 5} 份")
+        print("        (確認裡面沒有你要留的東西之後可以自行刪除;"
+              "★刻意不放回 ~/.claude/skills/★——放那裡會被當成新 skill 載入)")
     print("★未動★:任何專案目錄、~/.claude/settings.json、~/.claude/hooks/、其他 skill;")
     print("        CLAUDE.md 除了上面那塊 LUMOS-SLIM sentinel 區塊(及它取代掉的完整版")
     print("        區塊,若有 — 已還原),其餘內容原封不動。")

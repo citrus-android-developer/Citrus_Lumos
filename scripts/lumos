@@ -58,7 +58,13 @@ BlockSpan = namedtuple("BlockSpan", "body body_start body_end")
 # Task 2: ReInjectResult ─ status ∈ created|updated|unchanged|appended|sentinel_broken|no_template
 ReInjectResult = namedtuple("ReInjectResult", "status diff")
 
-FENCE_RE = re.compile(r"^```.*?^```", re.S | re.M)
+# ★FENCE_RE 已於 2026-08-03 移除,不要再加回來★——它有兩個致命假設:
+#   ①圍欄成對(未閉合就看不見) ②標記在第 0 欄(收尾縮排會與下一個區塊錯配、
+#   把中間的真散文整段吞掉)。這兩個假設在 code-loop r2/r4 各造成實測的靜默錯答:
+#   幽靈圖譜邊、假合約佐證、G1 硬閘對壞引用放行、impact hook 漏掉合約節點。
+# ★一律改用 `_visible_lines`(全檔唯一的 fence 判定)★:
+#   要「剝圍欄 + 剝 inline code」→ `_strip_code_text`
+#   要「只剝圍欄、★保留 inline code★」→ `_strip_fences_text`(refcheck 家族要這個)
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
 DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
@@ -203,7 +209,7 @@ def load_vault(vault: Path):
             fields, block_keys, lint = parse_frontmatter(fm_lines)
         else:
             fm_lines, fields, block_keys, lint = [], {}, set(), []
-        body_clean = INLINE_CODE_RE.sub("", FENCE_RE.sub("", body))
+        body_clean = _strip_code_text(body)   # ★不可換回 FENCE_RE:看不見未閉合圍欄→幽靈邊★
         # frontmatter 連結規則(對齊 Obsidian): 整個值恰為一個 wikilink 才索引,
         # 夾在散文中間的 [[..]] 不算;block scalar 整段排除(鐵則 2)
         fm_targets = []
@@ -506,6 +512,36 @@ def run_doctor(env: Env, strict: bool, color: bool, suggest=False, ci=False):
     else:
         warn(sorted(orphans), f"發現 {len(orphans)} 個 Verification 沒任何 incoming link:",
              "找到它驗證的 Systems 並補進 verified_by(`--suggest` 看推薦掛載目標)")
+    print()
+
+    # ── ★未閉合 frontmatter(2026-08-03 code-loop r4 抓到的既有 major)★ ──
+    # `split_frontmatter` 假設 frontmatter 成對:少一個收尾 `---` 就回 (None, 整份檔),
+    # 於是★整份檔(含 frontmatter)當 body 索引★,後果實測有三:
+    #   ①該節點的 ★INVARIANT★ ★從 contracts 完全消失★(合約登記簿靜默少一條)
+    #   ②block scalar 裡的 [[wikilink]] 變成★真的圖譜邊★(鐵則 2 靜默失效)
+    #   ③doctor 輸出★完全不提這個檔★(連 Check S 都沒有它,因為讀不到 type)
+    # ★寫入端 `load_raw_for_edit` 對同一狀態明確 raise ValueError,讀取端卻默默照收★
+    # ——這道檢查就是把讀取端的沉默補成響亮。放硬 issue(不是軟提醒):它會讓
+    # pre-push 的 `doctor --ci` 擋下來,因為靜默少一條合約正是本工具最不能接受的事。
+    section("1.5/4", "未閉合 frontmatter (整份檔被當 body 索引 → 合約靜默蒸發)")
+    _fm_broken = []
+    for _rel in sorted(env.notes):
+        try:
+            _t = (env.vault / _rel).read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        if not _t.startswith("---"):
+            continue          # 沒 frontmatter 是合法的,不管
+        _ls = _t.split("\n")
+        if not any(_ls[_i].strip() == "---" for _i in range(1, len(_ls))):
+            _fm_broken.append(_rel)
+    if not _fm_broken:
+        ok("沒有未閉合的 frontmatter")
+    else:
+        warn(_fm_broken,
+             f"發現 {len(_fm_broken)} 篇 frontmatter 開了沒收(以 --- 起頭但找不到收尾 ---):",
+             "補上收尾的 `---`。★在補之前該檔的硬合約不會出現在 contracts、"
+             "block scalar 裡的 [[連結]] 會變成真的圖譜邊★")
     print()
 
     section("2/4", "Unresolved wikilinks (破連結)")
@@ -1076,7 +1112,8 @@ def run_doctor(env: Env, strict: bool, color: bool, suggest=False, ci=False):
                 text = (env.vault / rel).read_text(encoding="utf-8-sig")
             except OSError:
                 continue
-            spans = [s.strip("`") for s in INLINE_CODE_RE.findall(FENCE_RE.sub("", text))]
+            # ★不可換回 FENCE_RE★:它錨第 0 欄、假設成對,縮排收尾會吞掉真散文(見 _visible_lines)
+            spans = [s.strip("`") for s in INLINE_CODE_RE.findall(_strip_fences_text(text))]
             seen_paths = set()
             for raw in spans:
                 if "://" in raw or any(c in raw for c in "*<>?"):
@@ -1308,6 +1345,91 @@ def _is_forgotten(env, rel):
     return str(n.fields.get("status") or "").strip().lower() == "superseded"
 
 
+def _strip_code_text(text, include_code=False):
+    """把「程式碼區塊/inline code 以外看得見的文字」串成一段——★整段文字層的唯一實作★。
+
+    ★為什麼不用 `FENCE_RE.sub("")`(2026-08-03 code-loop r2,全局哨兵抓到,附兩處實測重現)★:
+    `FENCE_RE` 是成對非貪婪比對,★看不見未閉合的 ``` 圍欄★。同一個弱點原本散在四處,
+    其中兩處後果比 search 嚴重得多——
+      ① `load_vault()`:未閉合圍欄裡的 `[[wikilink]]` ★被當成真的圖譜邊索引進去★
+         → 幽靈連結進入持久化的圖結構(backlinks 實測會多報一條)。
+      ② `cmd_guard_trace()`:未閉合圍欄裡的測試名 ★被當成合約的真實佐證★
+         → 污染 ★INVARIANT★→[test:]→Verification 證據鏈,正好打臉該指令自己的保證。
+    逐行 toggle 的語意才是對的:未閉合圍欄之後一律視為 code(隱形),與主搜尋一致。
+    ★爆炸半徑(2026-08-03 r3 由 Codex 覆核後修正,原宣稱過強)★:
+      ・全庫 220 篇★無任何未閉合圍欄★(兩方各自掃過,一致)
+      ・wikilink 邊集合 ★新舊完全相同(差集為空)★
+        ★這裡刻意★不寫具體數字★,只寫不變量★——2026-08-03 r4 三位審查員各自
+        獨立量,得到 436/382/728、976/728/240 等多組互不相同的值,沒有一個等於
+        我原本抄來的「354」(那是 `lumos export --format dot` 的邊數口徑)。
+        ★「邊數是多少」取決於你怎麼數(出現次數/去重/含不含 frontmatter/解析前後),
+        但「新舊相同」與口徑無關——★該記的是不變量,不是那個數★。
+        要自己驗:任選一種口徑,對 `body_clean` 用舊寫法與 `_strip_code_text`
+        各算一次邊集合,比差集。
+        ★過程檢討:我當初把 r3 審查員報告裡的數字直接抄進 docstring、沒有自己量,
+         正是本專案同日剛在圖譜更正過的「數字被沿用進句子」——只是碰巧站得住★
+      ・`guard trace` 全 vault 輸出 ★逐字元相同★(67 行,實測 diff)
+      ・★但「清洗後文字一個字都不變」這個更強的說法不成立★:33-36 篇不同
+        (兩位審查員各自量到 33 與 36,計數口徑略異;方向一致)——新法(逐行
+        `lstrip().startswith("```")`)接受★縮排的圍欄★,舊 `FENCE_RE` 只認第 1 欄。
+        ★這是與不閉合圍欄★正交★的另一類變化,原本的「爆炸半徑=0」理由沒涵蓋它★;
+        方向上新法與主搜尋一致(search 一直都是逐行 lstrip)、也與 CommonMark 一致,
+        故判定為修正而非回歸——但★這是事後補的論證,不是原本就驗過的★。
+    """
+    return "\n".join(pr for _no, _raw, pr in _search_visible_lines(text.split("\n"), include_code))
+
+
+def _visible_lines(lines, keep_fenced=False):
+    """★全檔唯一的 fenced-code 判定實作★:逐行 toggle,回 (行號從1起, 原始行)。
+
+    `keep_fenced=True` 時保留圍欄★內★的文字(但仍跳過 ``` 標記行本身)。
+
+    ★為什麼所有人都必須走這裡(2026-08-03 code-loop r2/r4)★:原本各處自己用
+    `FENCE_RE = re.compile(r"^```.*?^```", re.S | re.M)`,那個正則有兩個致命假設——
+      ① 假設圍欄★成對★:未閉合的圍欄看不見(r2 抓到:幽靈圖譜邊、假合約佐證)
+      ② 假設圍欄標記★在第 0 欄★:收尾圍欄一縮排就跟下一個區塊的開頭錯配,
+         ★把中間的真散文整段當程式碼吞掉★(r4 抓到,實測某條路徑宣稱直接消失)
+    ②的消費端是治理機制本身(refcheck → design-loop 的 G1 硬閘、Edit/Write 前
+    自動注入必看合約的 impact hook)——★一個縮排的 ``` 就能把某節點的鐵則警告
+    靜默關掉★。逐行 toggle 對兩個假設都免疫。
+    """
+    in_fence = False
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("```"):       # fenced code 邊界
+            in_fence = not in_fence
+            continue
+        if in_fence and not keep_fenced:
+            continue
+        yield i + 1, ln
+
+
+def _strip_fences_text(text):
+    """只剝 fenced code block,★保留 inline code★——給 refcheck 家族用。
+
+    ★為什麼不能用 `_strip_code_text`★:那支連 inline code 一起剝,而 refcheck
+    要抽的路徑宣稱★正是寫在 inline code 裡★(`` `scripts/foo.py:12` ``)。
+    用錯會讓所有宣稱憑空消失、G1 對著空清單宣告通過。
+    """
+    return "\n".join(ln for _no, ln in _visible_lines(text.split("\n")))
+
+
+def _search_visible_lines(lines, include_code):
+    """產生 (行號從1起, 原始行, 比對用 probe)——★search 的「哪些字看得見」唯一實作★。
+
+    ★為什麼要抽出來(2026-08-03 code-loop r1,slot3 附實測)★:多詞回退的預檢原本自己
+    寫了一份「整段 regex 剝 fence」,與主迴圈的「逐行 in_fence toggle」是★兩份實作★,
+    遇到★未閉合的 ``` 圍欄★就分岔:主迴圈把圍欄後全部視為 code(隱形),預檢的成對
+    regex 剝不掉懸空那半段(仍可見)。後果不是「回退多觸發一次」這種小事——是
+    ★逐詞覆蓋虛報非零★:實測單獨搜某詞 0 篇,覆蓋卻印該詞 1 篇,直接打臉 M1.5
+    「告訴你哪個詞 0 命中」的存在理由。
+    ★我原本在註解裡把這個邊界寫成「方向保守、無害」——那個評估只涵蓋了「回退觸發
+    與否」,沒涵蓋「覆蓋數字本身」。同一個坑今天第六次:用一個後果描述邊界,另一個
+    後果就不在視野裡。★ 修法不是補正則,是讓兩邊共用這一份。
+    """
+    for _no, ln in _visible_lines(lines, keep_fenced=include_code):
+        yield _no, ln, (ln if include_code else INLINE_CODE_RE.sub("", ln))
+
+
 def cmd_search(env, term, path_prefix=None, regex=False, files_only=False, include_code=False,
                ranked=False, top=20, as_json=False, include_superseded=False,
                any_terms=True):
@@ -1368,10 +1490,9 @@ def cmd_search(env, term, path_prefix=None, regex=False, files_only=False, inclu
                 _t = (env.vault / _r).read_text(encoding="utf-8-sig")
             except Exception:
                 continue
-            if not include_code:
-                _t = re.sub(r"(?ms)^\s*```.*?^\s*```", "", _t)
-                _t = INLINE_CODE_RE.sub("", _t)
-            _low = nfc(_t).lower()
+            # ★與主迴圈共用同一份「可見行」實作★(不再自己剝一次,見 _search_visible_lines)
+            _low = nfc("\n".join(pr for _no, _raw, pr
+                                  in _search_visible_lines(_t.split("\n"), include_code))).lower()
             # ★順手數逐詞覆蓋(M1.5)★:本圈本來就讀了每個檔、也做過同樣的排除,
             # 多幾次子字串測試幾乎免費;不另開一圈。找到片語就 break,那時
             # 覆蓋數不完整——但那條路不會回退、也就不會印,無害。
@@ -1395,10 +1516,33 @@ def cmd_search(env, term, path_prefix=None, regex=False, files_only=False, inclu
             # 的機器可讀輸出(--json/--files-only 的呼叫端會解析它)。
             _cov_txt = "  ".join(f"★{t}:0★" if _fb_cov.get(t, 0) == 0 else f"{t}:{_fb_cov.get(t, 0)}"
                                  for t in _fb_terms)
-            print(f"（多詞回退:整串片語全庫無命中,改用各詞 OR 召回;"
+            # ★措辭必須是「未作廢的節點裡無命中」不是「全庫無命中」★
+            # (2026-08-03 code-loop r1,slot3 附實測;slot2 同一處判 minor,依規矩取高)
+            # 為什麼:預檢刻意跳過 superseded(那是對的——被藏起來的東西對使用者等於
+            # 不存在,此時該回退)。但若片語★只★出現在一篇作廢節點裡,舊措辭會印
+            #   （多詞回退:整串片語★全庫無命中★…）
+            #   （已隱藏 1 筆作廢結果，--include-superseded 顯示）
+            # ★兩行自相矛盾★:第一行斷言全庫沒有,第二行承認有 1 筆被藏。使用者只看
+            # 最顯眼的第一行,會斷定「圖譜裡沒這東西」→ 可能重造一個已存在的節點。
+            # ★危險方向是「誤判為不存在」,比多顯示一點雜訊嚴重★。
+            # ★訊息宣稱的範圍不得大於實際檢查的範圍★——這條在同一天被抓到★三次★:
+            #   r1:片語只在作廢節點時說「全庫無命中」(其實有,只是被藏)
+            #   r2:`--path` 限定時仍說「未作廢的節點裡/全庫」(其實只掃了子集)
+            # 兩次都是同一個錯:★用一個維度描述範圍,另一個維度就不在視野裡★。
+            # 既有慣例本來就有揭露路徑範圍(見本函式尾端 `suffix = f"(限 {path_prefix})"`),
+            # 這裡沒跟上。修法:範圍字串把「作廢」與「路徑」兩個維度都串進去。
+            #   r3:第四個維度 `--code`(codex minor)——預設不搜 code block,片語若只
+            #       存在於程式碼區塊裡,說「節點裡無命中」仍不精確。
+            _sc = []
+            if path_prefix:
+                _sc.append(f"{path_prefix} 底下")
+            _sc.append("未作廢的節點" if not include_superseded else "全部節點")
+            _sc.append("(含程式碼區塊)" if include_code else "的可見文字")
+            _scope_txt = "".join(_sc)
+            print(f"（多詞回退:整串片語在{_scope_txt}裡無命中,改用各詞 OR 召回;"
                   f"逐詞覆蓋 {_cov_txt}）", file=sys.stderr)
             if any(_fb_cov.get(t, 0) == 0 for t in _fb_terms):
-                print("  ★有詞在全庫 0 命中(標 ★)——多半是查詢用詞與圖譜用語不一致,"
+                print(f"  ★有詞在{_scope_txt}裡 0 命中(標 ★)——多半是查詢用詞與圖譜用語不一致,"
                       "先換那個詞再查,別把結果當「圖譜沒有」★", file=sys.stderr)
     if ranked and regex:
         print("(--ranked 不適用 --regex 模式,照舊輸出)", file=sys.stderr)
@@ -1421,16 +1565,10 @@ def cmd_search(env, term, path_prefix=None, regex=False, files_only=False, inclu
                 if lines[i].strip() == "---":
                     fm_end = i + 1
                     break
-        hits, in_fence = [], False
-        for i, ln in enumerate(lines):
-            if ln.lstrip().startswith("```"):       # fenced code 邊界
-                in_fence = not in_fence
-                continue
-            if in_fence and not include_code:
-                continue
-            probe = ln if include_code else INLINE_CODE_RE.sub("", ln)
+        hits = []
+        for _no, ln, probe in _search_visible_lines(lines, include_code):
             if matches(probe):
-                hits.append((i + 1, ln))
+                hits.append((_no, ln))
         if not hits:
             continue
         # 真遺忘濾網(★插點=命中確認後、三路分岔前):預設藏 superseded,--include-superseded 逃生。
@@ -3148,7 +3286,8 @@ def cmd_guard_trace(env, node=None):
         if r.startswith("Verification/"):
             try:
                 raw = (env.vault / r).read_text(encoding="utf-8-sig")
-                verif_text[r] = INLINE_CODE_RE.sub("", FENCE_RE.sub("", raw))
+                # ★同上:未閉合圍欄裡的測試名會被當成真佐證,污染合約證據鏈★
+                verif_text[r] = _strip_code_text(raw)
             except Exception:
                 verif_text[r] = ""
     # 多平台:refs 帶 平台: 前綴(如 android:X),但 Verification 文字寫的是裸方法名 X →

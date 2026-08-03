@@ -1,0 +1,15 @@
+# ★.ps1 必須是 UTF-8 with BOM(2026-08-03 真機驗證血的教訓)★
+# Windows PowerShell 5.1 從磁碟執行 .ps1 時,★沒有 BOM 就用系統 ANSI codepage 讀檔★。
+# 這幾支有大量中文註解,在 cp950/cp936/cp932/cp949 底下,DBCS 前導位元組會
+# ★無條件吃掉下一個位元組★——若那個位元組正好是 `"`,引號就消失、parser 配對錯亂,
+# 最後在一行純 ASCII 的程式碼上報 "The string is missing the terminator"。
+# 實測(中文 Windows 11 / cp950):get.ps1 少 5 個引號、install/uninstall 各少 1 個,
+# ★README 教的一行安裝指令 100% 失敗、什麼都沒裝★。
+# working-tree-encoding=UTF-8 讓 git 不會把 BOM 剝掉;eol=CRLF 對齊 Windows 慣例。
+*.ps1 text working-tree-encoding=UTF-8 eol=CRLF
+* text=auto eol=lf
+*.md text eol=lf
+scripts/lumos text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
