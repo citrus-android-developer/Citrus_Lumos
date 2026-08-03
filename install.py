@@ -102,6 +102,25 @@ def _sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _skill_backup_path(dst: Path) -> Path:
+    """skill 備份的落點——★必須在 ~/.claude/skills/ 之外★。
+
+    `~/.claude/skills/` 是 Claude Code 掃描 skill 的目錄:往裡面放任何含 `SKILL.md`
+    的子目錄都會被載入。把備份改名留在原地(舊做法)等於★讓被取代的 skill 換個怪名字
+    繼續生效★,而且★卸載器不會清它★(卸載只認 `lumos-project-notes` 這個名字)。
+    落點選 `~/.local/share/lumos-slim/backups/`:與 manifest 同一處、語意一致、
+    且不在任何掃描範圍。`uninstall.py` 用同一個落點——★兩邊必須一致★。
+    """
+    root = Path.home() / ".local" / "share" / "lumos-slim" / "backups"
+    base = f"{dst.name}.bak.{time.strftime('%Y%m%d%H%M%S')}"
+    candidate = root / base
+    n = 1
+    while candidate.exists() or candidate.is_symlink():
+        candidate = root / f"{base}.{n}"
+        n += 1
+    return candidate
+
+
 def _unique_backup_path(dst: Path) -> Path:
     """回傳一個保證還不存在的 `<dst>.bak.<timestamp>[.N]` 路徑。★為什麼不能只
     用秒級時間戳★:bash 版本原本 `mv "$DST_SKILL" "$BAK"`——`$BAK` 若剛好已存在
@@ -301,9 +320,20 @@ def _install_skill(pkg: Path, skills_dir: Path, force: bool):
         if not force:
             print(f"⚠ {dst_skill} 已存在,加 --force 覆寫(★會先備份★)", file=sys.stderr)
             return 2
-        bak = _unique_backup_path(dst_skill)
+        # ★備份落點必須離開 ~/.claude/skills/(2026-08-03 Windows 真機回歸測試抓到)★
+        # 前一版只修了 uninstall.py,★安裝端漏了★——而安裝端留下的備份問題更大:
+        #   ①它立刻被 Claude Code 當成有效 skill 載入(實測清單真的出現
+        #     `lumos-project-notes.bak.<ts>`)
+        #   ②★卸載器不會清它★——卸載只搬走 `lumos-project-notes` 本身,
+        #     於是那份備份會★永遠留在 skills 目錄裡持續生效★
+        # 落點與 uninstall.py 一致:~/.local/share/lumos-slim/backups/
+        # ★兩邊必須同落點★:不同落點就等於又製造一次「同一件事兩份實作」。
+        bak = _skill_backup_path(dst_skill)
+        bak.parent.mkdir(parents=True, exist_ok=True)
         dst_skill.rename(bak)
         print(f"  已備份既有 skill → {bak}")
+        print(f"  (★刻意不留在 {dst_skill.parent}★——留在那裡會被 Claude Code "
+              f"當成一個新 skill 載入,而且卸載器不會清它)")
 
     shutil.copytree(src_skill, dst_skill)
     print(f"✓ skill: {dst_skill}")
