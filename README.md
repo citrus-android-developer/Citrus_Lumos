@@ -20,16 +20,36 @@ irm https://raw.githubusercontent.com/citrus-android-developer/Citrus_Lumos/main
 
 裝完後 `lumos` 指令會落在 `~/.local/bin`（Windows 是 `%USERPROFILE%\.local\bin`）——這個路徑通常**不在預設 PATH 裡**，需要自己加：macOS/Linux 在 shell 設定檔（`~/.zshrc`／`~/.bashrc`）加一行 `export PATH="$HOME/.local/bin:$PATH"`；Windows 把 `%USERPROFILE%\.local\bin` 加進「系統環境變數」的使用者 PATH（安裝器結尾若偵測到不在 PATH 裡,會依平台印出對應提示）。
 
-★**誠實標記,別誤讀成「Windows 已驗證」**★：這台開發機是 macOS,沒有 Windows/PowerShell 環境可用,**Windows 路徑沒有在真機上跑過**。`install.py`/`uninstall.py` 的邏輯與 Unix 共用同一份 Python 原始碼,Windows 分支（`.cmd` shim 產生、PATH 提示文字）靠 `LUMOS_SLIM_SIMULATE_WINDOWS=1` 環境變數在非 Windows 機器上注入、只驗證過**分支邏輯本身跑對路**（見 `scripts/test_lumos.py` 的 `t_slim_install_windows_*`/`t_slim_uninstall_windows_*` 系列）——`.cmd` shim 在真實 `cmd.exe`/PowerShell 下能不能被正確找到並執行、`install.ps1`/`uninstall.ps1`/`get.ps1` 這三支 `.ps1` 薄殼本身、PATH 環境變數在 Windows 上的實際生效方式,都**沒有機會做真機驗證**。若你在 Windows 上使用本包遇到問題,請直接檢查 `install.py`/`uninstall.py`（跨平台邏輯都在這兩支,可讀可改)。
+★**Windows 真機驗證狀態（2026-08-03 更新）**★
 
-★**2026-08 Task 14 新增兩項未驗清單(同款誠實聲明,不要誤讀成已解決)**★:
-- **`.cmd` shim 直譯器 fallback**——shim 呼叫用的直譯器名稱(`python3`/`python`)改成安裝當下用 `shutil.which()` 偵測、寫進 shim(見 `install.py` 的 `_pick_windows_interpreter()`),不再寫死字面 `python`。用意是修「Windows 機器只有 `python3.exe`、沒有 `python.exe` 時裝完即壞」這個問題,邏輯層級已用 `LUMOS_SLIM_SIMULATE_WINDOWS=1` 驗過(`t_slim_install_windows_shim_does_not_hardcode_python_when_only_python3_available`),但 `shutil.which()` 在真實 Windows `cmd.exe`/PowerShell 環境下解析 PATH 的實際行為(含副檔名 `.exe` 解析、`PATHEXT` 等)沒有真機驗證過。
-- **`.ps1` 全程不再呼叫 `exit`**——`install.ps1`/`uninstall.ps1`/`get.ps1` 三支原本收尾是裸的 `exit $LASTEXITCODE`,理由是 `exit` 在 `irm ... | iex`/`& "路徑\install.ps1"` 這種呼叫鏈裡會終止整個呼叫端 PowerShell session,不像 bash 子行程只結束自己(Task 14 先修的收尾那一處)。**2026-08 Task 15 補上殘留缺陷**:三支檔案早期錯誤分支(找不到 python3/python、找不到 git、`git pull`/`git clone` 失敗、交付包不完整,共 6 處)當時仍留著裸的 `exit 2`——這幾處反而更該修,因為全在錯誤路徑上,使用者最需要看到錯誤訊息的時候,視窗反而被關掉,連錯在哪都來不及讀。現在三支檔案的邏輯都包進一個函式,錯誤分支印完訊息後用函式層級的 `return <int>`(不是 `exit`)中止,呼叫端在腳本最下方把函式回傳值收進 `$global:LASTEXITCODE`。**這整段修法(結尾與早期分支)本身都沒有真機驗證過**——只能推理不會再主動關掉呼叫端視窗、`return` 不會意外落空(有靜態結構測試 `t_slim_ps1_error_branches_still_halt_via_return` 驗過「錯誤訊息後一定接 `return`」,但驗不到 PowerShell 的真實執行語意),改法是否真的完全解決原問題、`$LASTEXITCODE` 在各種呼叫路徑下是否確實對呼叫端可見,都得等真機驗證才能下定論。
+三支 `.ps1` 的開頭曾長期掛著「沒有在真機 Windows 上跑過」。**已經兌現了**——
+有人在中文 Windows 11（PowerShell 5.1、ANSI codepage = big5/950、Python 3.8.10）
+上實測了三輪，前兩輪各回報一批缺陷，第三輪（`v1.5-handoff`）**一次通過**。
 
-★**2026-08 Task 16 分支終審抓到三條缺陷,同款誠實聲明,不要誤讀成已解決**★:
-- **①BLOCKER,`$ErrorActionPreference = "Stop"` 讓 Task 14/15 那批 `Write-Error`+`return` 修法在錯誤路徑上等於沒做**——PowerShell 語意:`Stop` 模式下 `Write-Error` 這種非終止型錯誤會被升級成終止型例外(等同 `throw`)。後果:`Write-Error` 那行直接拋例外,它後面的 `return <int>` 是死碼、永遠執行不到;例外炸穿呼叫端函式,連 `$rc = Invoke-* ...` 的賦值都完成不了;檔尾 `$global:LASTEXITCODE = $rc` 永遠不執行,呼叫端讀到的是殘留舊值(很可能是 0)——把失敗誤判成成功。修法:三支檔案共 6 處 `Write-Error` 都加 `-ErrorAction Continue` 明確覆寫(PowerShell 官方支援的逐次呼叫覆寫機制,對單一 cmdlet 呼叫的 `-ErrorAction` 會蓋過 `$ErrorActionPreference`)。**這段修法本身沒有真機驗證過**——`-ErrorAction Continue` 在真實 PowerShell 執行時是否確實蓋過 `$ErrorActionPreference`,只能相信官方文件,沒有機會實際跑一行 `$ErrorActionPreference = "Stop"; Write-Error "x" -ErrorAction Continue; Write-Host "still alive"` 驗證「still alive」真的印得出來。
-- **③MINOR,`get.ps1` 的 `$ErrorActionPreference` 原本寫在頂層(函式外),會污染呼叫端互動 session**——README 教的一行安裝 `irm ... | iex` 中,`iex` 在**呼叫端當下的 scope** 執行(不像 `& "path.ps1"` 會建新 script scope),這行會直接改到使用者互動 shell 的設定且裝完不還原,同一視窗裡任何原本靠非終止型錯誤運作的後續指令都會被意外中止。修法:把賦值搬進 `Invoke-Get` 函式內部第一行(函式預設有自己的子 scope,函式內賦值不外溢回呼叫端);`install.ps1`/`uninstall.ps1` 因為經 `&` 呼叫本來就有自己的 script scope,不受影響,但一併搬進函式維持三支檔案寫法一致。**這段 scope 隔離語意本身也沒有真機驗證過**——這台機器沒有 PowerShell,無法實際驗證 `iex` 執行下函式內賦值真的不會外溢回呼叫端 session。
-- **②MAJOR(Python 邏輯,不是 `.ps1` 未驗清單的一員)Windows 卸載孤兒 `lumos.cmd` 永遠清不掉**——`uninstall.py` 舊版把 `lumos.cmd` 的移除邏輯巢狀在 `lumos` 的 `if` 區塊裡,`lumos` 被手動刪除但 `lumos.cmd` 還在時,整段(含 `--force` 分支)都跳過。已改成獨立區塊,用 shim 固定樣板內容比對當安全基準,並用 `LUMOS_SLIM_SIMULATE_WINDOWS=1` + git-stash 因果驗證(紅→綠,非稻草人)。這條**不在**「未在真機驗證」清單裡——它是 Python 邏輯,驗證方式與既有 Windows 分支邏輯測試一致;但 `.cmd` shim 在真實 `cmd.exe`/PowerShell 下能不能被正確找到並執行,仍與既有未驗清單相同,未擴大也未縮小。
+**現在有真機證據的：**
+
+| 項目 | 證據 |
+|---|---|
+| 一行安裝 `irm … \| iex` | v1.5 實測通過 |
+| `~\.local\bin\lumos` ＋ `lumos.cmd` shim 真的能被找到並執行 | 實測 `lumos stats` 讀到 275 篇圖譜、`lumos search` 排序正常 |
+| `.ps1` 不再關掉呼叫端視窗、`return` 真的中止 | 錯誤路徑實測回 `rc=2`（會印訊息且不炸掉 session） |
+| `$LASTEXITCODE` 對呼叫端可見且型別正確 | 實測成功 `rc=[0]`、失敗 `rc=[2]`，皆 `Int32` |
+| `-ErrorAction Continue` 真的蓋過 `$ErrorActionPreference = "Stop"` | 錯誤路徑印得出訊息且流程繼續 → 反證它生效 |
+| CLAUDE.md 位元組級備份／還原 | 三輪都驗過，卸載後 `git status` 完全 clean |
+| 卸載不誤動使用者自有 skill | 三輪都驗過 |
+
+**仍然沒有真機證據的（不要誤讀成已解決）：**
+
+- **`PATHEXT` 的完整解析細節**——`shutil.which()` 有找到直譯器（安裝成功即證），
+  但各種 `PATHEXT` 組合下的行為沒有逐一測過。
+- **非 big5 的其他 CJK codepage**（cp936 簡中／cp932 日文／cp949 韓文）——
+  機制相同（都是雙位元組編碼），但只在 cp950 上實測過。
+- **`.ps1` 的三支現在是 ASCII-only 且不加 BOM**，這讓「系統編碼誤解碼」
+  在原理上不可能發生（沒有非 ASCII 位元組），比先前的「加 BOM」是更強的保證——
+  但這是**論證**，不是那三個 codepage 上的實測。
+
+若你在 Windows 上遇到問題，跨平台邏輯全在 `install.py`／`uninstall.py`（可讀可改），
+`.ps1` 只是薄殼；三支 `.ps1` 的中文設計說明在 `WINDOWS-NOTES.md`。
 
 ## 怎麼裝
 
